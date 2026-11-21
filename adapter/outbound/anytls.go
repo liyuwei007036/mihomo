@@ -6,9 +6,11 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/anytls"
@@ -20,8 +22,11 @@ import (
 
 type AnyTLS struct {
 	*Base
-	client *anytls.Client
-	option *AnyTLSOption
+	client       *anytls.Client
+	winMu        sync.Mutex
+	winClient    *anytls.Client
+	newWinClient func() *anytls.Client
+	option       *AnyTLSOption
 }
 
 type AnyTLSOption struct {
@@ -50,8 +55,20 @@ type AnyTLSOption struct {
 	DisableReuse             bool             `proxy:"disable-reuse,omitempty"`
 }
 
+func (t *AnyTLS) selectClient(ctx context.Context) *anytls.Client {
+	if !isWindowsTTLContext(ctx) || t.newWinClient == nil {
+		return t.client
+	}
+	t.winMu.Lock()
+	defer t.winMu.Unlock()
+	if t.winClient == nil {
+		t.winClient = t.newWinClient()
+	}
+	return t.winClient
+}
+
 func (t *AnyTLS) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	c, err := t.client.CreateProxy(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+	c, err := t.selectClient(ctx).CreateProxy(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +81,7 @@ func (t *AnyTLS) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 	}
 
 	// create tcp
-	c, err := t.client.CreateProxy(ctx, uot.RequestDestination(2))
+	c, err := t.selectClient(ctx).CreateProxy(ctx, uot.RequestDestination(2))
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +105,20 @@ func (t *AnyTLS) ProxyInfo() C.ProxyInfo {
 
 // Close implements C.ProxyAdapter
 func (t *AnyTLS) Close() error {
-	return t.client.Close()
+	var errs []error
+	if err := t.client.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	t.winMu.Lock()
+	winClient := t.winClient
+	t.winClient = nil
+	t.winMu.Unlock()
+	if winClient != nil {
+		if err := winClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
@@ -171,6 +201,11 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
 
 	client := anytls.NewClient(context.TODO(), tOption)
 	outbound.client = client
+	outbound.newWinClient = func() *anytls.Client {
+		winOption := tOption
+		winOption.Dialer = wrapSingDialerWithTTL(singDialer, dialer.WindowsInitialTTL)
+		return anytls.NewClient(context.TODO(), winOption)
+	}
 
 	return outbound, nil
 }

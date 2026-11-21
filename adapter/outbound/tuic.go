@@ -6,9 +6,11 @@ import (
 	"math"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/tuic"
@@ -23,8 +25,11 @@ import (
 
 type Tuic struct {
 	*Base
-	option *TuicOption
-	client *tuic.PoolClient
+	option       *TuicOption
+	client       *tuic.PoolClient
+	winMu        sync.Mutex
+	winClient    *tuic.PoolClient
+	newWinClient func() *tuic.PoolClient
 
 	quicConfig *quic.Config
 	tlsConfig  *tls.Config
@@ -69,9 +74,21 @@ type TuicOption struct {
 	UDPOverStreamVersion int  `proxy:"udp-over-stream-version,omitempty"`
 }
 
+func (t *Tuic) selectClient(ctx context.Context) *tuic.PoolClient {
+	if !isWindowsTTLContext(ctx) || t.newWinClient == nil {
+		return t.client
+	}
+	t.winMu.Lock()
+	defer t.winMu.Unlock()
+	if t.winClient == nil {
+		t.winClient = t.newWinClient()
+	}
+	return t.winClient
+}
+
 // DialContext implements C.ProxyAdapter
 func (t *Tuic) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	conn, err := t.client.DialContext(ctx, metadata)
+	conn, err := t.selectClient(ctx).DialContext(ctx, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +120,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 			return NewPacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination}), t), nil
 		}
 	}
-	pc, err := t.client.ListenPacket(ctx, metadata)
+	pc, err := t.selectClient(ctx).ListenPacket(ctx, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +134,11 @@ func (t *Tuic) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
 	}
 	common.SetCongestionController(quicConn, t.option.CongestionController, t.option.CWND, t.option.BBRProfile)
 	return quicConn, nil
+}
+
+func (t *Tuic) dialWindows(ctx context.Context) (quicConn *quic.Conn, err error) {
+	ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+	return t.dial(ctx)
 }
 
 // ProxyInfo implements C.ProxyAdapter
@@ -280,6 +302,9 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		}
 
 		t.client = tuic.NewPoolClientV4(clientOption, t.dial)
+		t.newWinClient = func() *tuic.PoolClient {
+			return tuic.NewPoolClientV4(clientOption, t.dialWindows)
+		}
 	} else {
 		maxUdpRelayPacketSize := option.MaxUdpRelayPacketSize
 		if maxUdpRelayPacketSize > tuic.MaxFragSizeV5 {
@@ -294,6 +319,9 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		}
 
 		t.client = tuic.NewPoolClientV5(clientOption, t.dial)
+		t.newWinClient = func() *tuic.PoolClient {
+			return tuic.NewPoolClientV5(clientOption, t.dialWindows)
+		}
 	}
 
 	return t, nil

@@ -12,6 +12,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	tlsC "github.com/metacubex/mihomo/component/tls"
@@ -40,8 +41,11 @@ type Vmess struct {
 	option *VmessOption
 
 	// for gun mux
-	gunClient   *gun.Client
-	mekyaClient *mekya.Client
+	gunClient       *gun.Client
+	winGunMu        sync.Mutex
+	winGunClient    *gun.Client
+	newWinGunClient func() *gun.Client
+	mekyaClient     *mekya.Client
 
 	echConfig       *ech.Config
 	shadowTLSConfig *shadowtls.Config
@@ -379,10 +383,22 @@ func (v *Vmess) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 	return conn, nil
 }
 
+func (v *Vmess) selectGunClient(ctx context.Context) *gun.Client {
+	if !isWindowsTTLContext(ctx) || v.newWinGunClient == nil {
+		return v.gunClient
+	}
+	v.winGunMu.Lock()
+	defer v.winGunMu.Unlock()
+	if v.winGunClient == nil {
+		v.winGunClient = v.newWinGunClient()
+	}
+	return v.winGunClient
+}
+
 func (v *Vmess) dialContext(ctx context.Context) (c net.Conn, err error) {
 	switch v.option.Network {
 	case "grpc": // gun transport
-		return v.gunClient.Dial()
+		return v.selectGunClient(ctx).Dial()
 	case "mekya":
 		return v.mekyaClient.Dial(ctx)
 	case "mkcp", "kcp":
@@ -456,6 +472,15 @@ func (v *Vmess) Close() error {
 	var errs []error
 	if v.gunClient != nil {
 		if err := v.gunClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	v.winGunMu.Lock()
+	winGun := v.winGunClient
+	v.winGunClient = nil
+	v.winGunMu.Unlock()
+	if winGun != nil {
+		if err := winGun.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -648,6 +673,19 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 			option.GrpcOpts.MinStreams,
 			option.GrpcOpts.MaxStreams,
 		)
+		winDialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialFn(dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL), network, addr)
+		}
+		v.newWinGunClient = func() *gun.Client {
+			return gun.NewClient(
+				func() *gun.Transport {
+					return gun.NewTransport(winDialFn, tlsConfig, gunConfig)
+				},
+				option.GrpcOpts.MaxConnections,
+				option.GrpcOpts.MinStreams,
+				option.GrpcOpts.MaxStreams,
+			)
+		}
 	}
 
 	return v, nil

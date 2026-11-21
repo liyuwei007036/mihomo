@@ -8,12 +8,14 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/convert"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
@@ -44,9 +46,15 @@ type Vless struct {
 	encryption *encryption.ClientInstance
 
 	// for gun mux
-	gunClient *gun.Client
+	gunClient       *gun.Client
+	winGunMu        sync.Mutex
+	winGunClient    *gun.Client
+	newWinGunClient func() *gun.Client
 	// for xhttp
-	xhttpClient *xhttp.Client
+	xhttpClient       *xhttp.Client
+	winXHTTPMu        sync.Mutex
+	winXHTTPClient    *xhttp.Client
+	newWinXHTTPClient func() (*xhttp.Client, error)
 
 	echConfig       *ech.Config
 	shadowTLSConfig *shadowtls.Config
@@ -337,12 +345,44 @@ func (v *Vless) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 	return conn, nil
 }
 
+func (v *Vless) selectGunClient(ctx context.Context) *gun.Client {
+	if !isWindowsTTLContext(ctx) || v.newWinGunClient == nil {
+		return v.gunClient
+	}
+	v.winGunMu.Lock()
+	defer v.winGunMu.Unlock()
+	if v.winGunClient == nil {
+		v.winGunClient = v.newWinGunClient()
+	}
+	return v.winGunClient
+}
+
+func (v *Vless) selectXHTTPClient(ctx context.Context) (*xhttp.Client, error) {
+	if !isWindowsTTLContext(ctx) || v.newWinXHTTPClient == nil {
+		return v.xhttpClient, nil
+	}
+	v.winXHTTPMu.Lock()
+	defer v.winXHTTPMu.Unlock()
+	if v.winXHTTPClient == nil {
+		c, err := v.newWinXHTTPClient()
+		if err != nil {
+			return nil, err
+		}
+		v.winXHTTPClient = c
+	}
+	return v.winXHTTPClient, nil
+}
+
 func (v *Vless) dialContext(ctx context.Context) (c net.Conn, err error) {
 	switch v.option.Network {
 	case "grpc": // gun transport
-		return v.gunClient.Dial()
+		return v.selectGunClient(ctx).Dial()
 	case "xhttp":
-		return v.xhttpClient.Dial(ctx)
+		xc, err := v.selectXHTTPClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return xc.Dial(ctx)
 	default:
 	}
 	return v.dialer.DialContext(ctx, "tcp", v.addr)
@@ -423,8 +463,26 @@ func (v *Vless) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	v.winGunMu.Lock()
+	winGun := v.winGunClient
+	v.winGunClient = nil
+	v.winGunMu.Unlock()
+	if winGun != nil {
+		if err := winGun.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if v.xhttpClient != nil {
 		if err := v.xhttpClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	v.winXHTTPMu.Lock()
+	winXHTTP := v.winXHTTPClient
+	v.winXHTTPClient = nil
+	v.winXHTTPMu.Unlock()
+	if winXHTTP != nil {
+		if err := winXHTTP.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -611,6 +669,19 @@ func NewVless(option VlessOption) (*Vless, error) {
 			option.GrpcOpts.MinStreams,
 			option.GrpcOpts.MaxStreams,
 		)
+		winDialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialFn(dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL), network, addr)
+		}
+		v.newWinGunClient = func() *gun.Client {
+			return gun.NewClient(
+				func() *gun.Transport {
+					return gun.NewTransport(winDialFn, tlsConfig, gunConfig)
+				},
+				option.GrpcOpts.MaxConnections,
+				option.GrpcOpts.MinStreams,
+				option.GrpcOpts.MaxStreams,
+			)
+		}
 	case "xhttp":
 		requestHost := v.option.XHTTPOpts.Host
 		if requestHost == "" {
@@ -665,56 +736,59 @@ func NewVless(option VlessOption) (*Vless, error) {
 			ReuseConfig:          reuseCfg,
 		}
 
-		makeTransport := func() http.RoundTripper {
-			return xhttp.NewTransport(
-				func(ctx context.Context) (net.Conn, error) {
-					return v.dialer.DialContext(ctx, "tcp", v.addr)
-				},
-				func(ctx context.Context, raw net.Conn, isH2 bool) (net.Conn, error) {
-					return v.streamTLSConn(ctx, raw, isH2)
-				},
-				func(ctx context.Context, cfg *quic.Config) (*quic.Conn, error) {
-					host, _, _ := net.SplitHostPort(v.addr)
-					tlsOpts := &vmess.TLSConfig{
-						Host:              host,
-						SkipCertVerify:    v.option.SkipCertVerify,
-						NameCertVerify:    v.option.NameCertVerify,
-						FingerPrint:       v.option.Fingerprint,
-						Certificate:       v.option.Certificate,
-						PrivateKey:        v.option.PrivateKey,
-						ClientFingerprint: v.option.ClientFingerprint,
-						ECH:               v.echConfig,
-						Reality:           v.realityConfig,
-						NextProtos:        []string{"h3"},
-					}
-					if v.option.ServerName != "" {
-						tlsOpts.Host = v.option.ServerName
-					}
-					if !v.option.TLS {
-						return nil, errors.New("xhttp HTTP/3 requires TLS")
-					}
-					if securityMode != "" {
-						return nil, fmt.Errorf("xhttp HTTP/3 does not support %s", securityMode)
-					}
-					tlsConfig, err := tlsOpts.ToStdConfig()
-					if err != nil {
-						return nil, err
-					}
+		makeTransportFor := func(d C.Dialer) func() http.RoundTripper {
+			return func() http.RoundTripper {
+				return xhttp.NewTransport(
+					func(ctx context.Context) (net.Conn, error) {
+						return d.DialContext(ctx, "tcp", v.addr)
+					},
+					func(ctx context.Context, raw net.Conn, isH2 bool) (net.Conn, error) {
+						return v.streamTLSConn(ctx, raw, isH2)
+					},
+					func(ctx context.Context, cfg *quic.Config) (*quic.Conn, error) {
+						host, _, _ := net.SplitHostPort(v.addr)
+						tlsOpts := &vmess.TLSConfig{
+							Host:              host,
+							SkipCertVerify:    v.option.SkipCertVerify,
+							NameCertVerify:    v.option.NameCertVerify,
+							FingerPrint:       v.option.Fingerprint,
+							Certificate:       v.option.Certificate,
+							PrivateKey:        v.option.PrivateKey,
+							ClientFingerprint: v.option.ClientFingerprint,
+							ECH:               v.echConfig,
+							Reality:           v.realityConfig,
+							NextProtos:        []string{"h3"},
+						}
+						if v.option.ServerName != "" {
+							tlsOpts.Host = v.option.ServerName
+						}
+						if !v.option.TLS {
+							return nil, errors.New("xhttp HTTP/3 requires TLS")
+						}
+						if securityMode != "" {
+							return nil, fmt.Errorf("xhttp HTTP/3 does not support %s", securityMode)
+						}
+						tlsConfig, err := tlsOpts.ToStdConfig()
+						if err != nil {
+							return nil, err
+						}
 
-					err = v.echConfig.ClientHandle(ctx, tlsConfig)
-					if err != nil {
-						return nil, err
-					}
-					_, quicConn, err := common.DialQuic(ctx, v.addr, v.DialOptions(), v.dialer, tlsConfig, cfg, common.DialQuicOption{Early: true})
-					if err != nil {
-						return nil, err
-					}
-					return quicConn, nil
-				},
-				v.option.ALPN,
-				hKeepAlivePeriod,
-			)
+						err = v.echConfig.ClientHandle(ctx, tlsConfig)
+						if err != nil {
+							return nil, err
+						}
+						_, quicConn, err := common.DialQuic(ctx, v.addr, v.DialOptions(), d, tlsConfig, cfg, common.DialQuicOption{Early: true})
+						if err != nil {
+							return nil, err
+						}
+						return quicConn, nil
+					},
+					v.option.ALPN,
+					hKeepAlivePeriod,
+				)
+			}
 		}
+		makeTransport := makeTransportFor(v.dialer)
 		var makeDownloadTransport func() http.RoundTripper
 
 		if ds := v.option.XHTTPOpts.DownloadSettings; ds != nil {
@@ -911,6 +985,10 @@ func NewVless(option VlessOption) (*Vless, error) {
 		v.xhttpClient, err = xhttp.NewClient(cfg, makeTransport, makeDownloadTransport, v.realityConfig != nil)
 		if err != nil {
 			return nil, err
+		}
+		v.newWinXHTTPClient = func() (*xhttp.Client, error) {
+			winDialer := wrapDialerWithTTL(v.dialer, dialer.WindowsInitialTTL)
+			return xhttp.NewClient(cfg, makeTransportFor(winDialer), makeDownloadTransport, v.realityConfig != nil)
 		}
 	}
 

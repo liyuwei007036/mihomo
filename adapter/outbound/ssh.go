@@ -23,9 +23,10 @@ type Ssh struct {
 
 	option *SshOption
 
-	config *ssh.ClientConfig
-	client *ssh.Client
-	cMutex sync.Mutex
+	config    *ssh.ClientConfig
+	client    *ssh.Client
+	winClient *ssh.Client
+	cMutex    sync.Mutex
 }
 
 type SshOption struct {
@@ -55,9 +56,14 @@ func (s *Ssh) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, 
 }
 
 func (s *Ssh) connect(ctx context.Context, addr string) (client *ssh.Client, err error) {
+	isWin := isWindowsTTLContext(ctx)
 	s.cMutex.Lock()
 	defer s.cMutex.Unlock()
-	if s.client != nil {
+	if isWin {
+		if s.winClient != nil {
+			return s.winClient, nil
+		}
+	} else if s.client != nil {
 		return s.client, nil
 	}
 	c, err := s.dialer.DialContext(ctx, "tcp", addr)
@@ -87,14 +93,22 @@ func (s *Ssh) connect(ctx context.Context, addr string) (client *ssh.Client, err
 	}
 	client = ssh.NewClient(clientConn, chans, reqs)
 
-	s.client = client
+	if isWin {
+		s.winClient = client
+	} else {
+		s.client = client
+	}
 
 	go func() {
 		_ = client.Wait() // wait shutdown
 		_ = client.Close()
 		s.cMutex.Lock()
 		defer s.cMutex.Unlock()
-		if s.client == client {
+		if isWin {
+			if s.winClient == client {
+				s.winClient = nil
+			}
+		} else if s.client == client {
 			s.client = nil
 		}
 	}()

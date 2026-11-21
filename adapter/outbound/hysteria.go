@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
@@ -43,15 +44,38 @@ const (
 type Hysteria struct {
 	*Base
 
-	option *HysteriaOption
-	client *core.Client
+	option       *HysteriaOption
+	client       *core.Client
+	winMu        sync.Mutex
+	winClient    *core.Client
+	newWinClient func() (*core.Client, error)
 
 	tlsConfig *tls.Config
 	echConfig *ech.Config
 }
 
+func (h *Hysteria) selectClient(ctx context.Context) (*core.Client, error) {
+	if !isWindowsTTLContext(ctx) || h.newWinClient == nil {
+		return h.client, nil
+	}
+	h.winMu.Lock()
+	defer h.winMu.Unlock()
+	if h.winClient == nil {
+		c, err := h.newWinClient()
+		if err != nil {
+			return nil, err
+		}
+		h.winClient = c
+	}
+	return h.winClient, nil
+}
+
 func (h *Hysteria) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	tcpConn, err := h.client.DialTCP(metadata.String(), metadata.DstPort, h.genHdc(ctx))
+	client, err := h.selectClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tcpConn, err := client.DialTCP(metadata.String(), metadata.DstPort, h.genHdc(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +87,11 @@ func (h *Hysteria) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 	if err := h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	udpConn, err := h.client.DialUDP(h.genHdc(ctx))
+	client, err := h.selectClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	udpConn, err := client.DialUDP(h.genHdc(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -257,6 +285,13 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 		client:    client,
 		tlsConfig: tlsClientConfig,
 		echConfig: echConfig,
+		newWinClient: func() (*core.Client, error) {
+			return core.NewClient(
+				addr, ports, option.Protocol, auth, tlsClientConfig.Clone(), quicConfig, clientTransport, up, down, func(refBPS uint64) congestion.CongestionControl {
+					return hyCongestion.NewBrutalSender(congestion.ByteCount(refBPS))
+				}, obfuscator, hopInterval, option.FastOpen,
+			)
+		},
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 
@@ -265,10 +300,20 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 
 // Close implements C.ProxyAdapter
 func (h *Hysteria) Close() error {
+	var firstErr error
 	if h.client != nil {
-		return h.client.Close()
+		firstErr = h.client.Close()
 	}
-	return nil
+	h.winMu.Lock()
+	winClient := h.winClient
+	h.winClient = nil
+	h.winMu.Unlock()
+	if winClient != nil {
+		if err := winClient.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 type hyPacketConn struct {

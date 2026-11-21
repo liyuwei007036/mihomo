@@ -4,10 +4,12 @@ import (
 	"context"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/ntp"
 	"github.com/metacubex/mihomo/transport/shadowquic"
@@ -19,8 +21,11 @@ import (
 
 type ShadowQuic struct {
 	*Base
-	option *ShadowQuicOption
-	client *shadowquic.Client
+	option       *ShadowQuicOption
+	client       *shadowquic.Client
+	winMu        sync.Mutex
+	winClient    *shadowquic.Client
+	newWinClient func() *shadowquic.Client
 
 	quicConfig *quic.Config
 	tlsConfig  *tls.Config
@@ -51,8 +56,20 @@ type ShadowQuicOption struct {
 	MaxOpenStreams       int      `proxy:"max-open-streams,omitempty"`
 }
 
+func (s *ShadowQuic) selectClient(ctx context.Context) *shadowquic.Client {
+	if !isWindowsTTLContext(ctx) || s.newWinClient == nil {
+		return s.client
+	}
+	s.winMu.Lock()
+	defer s.winMu.Unlock()
+	if s.winClient == nil {
+		s.winClient = s.newWinClient()
+	}
+	return s.winClient
+}
+
 func (s *ShadowQuic) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	conn, err := s.client.DialContext(ctx, metadata)
+	conn, err := s.selectClient(ctx).DialContext(ctx, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +80,7 @@ func (s *ShadowQuic) ListenPacketContext(ctx context.Context, metadata *C.Metada
 	if err := s.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	pc, err := s.client.ListenPacket(ctx, metadata)
+	pc, err := s.selectClient(ctx).ListenPacket(ctx, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -71,10 +88,20 @@ func (s *ShadowQuic) ListenPacketContext(ctx context.Context, metadata *C.Metada
 }
 
 func (s *ShadowQuic) Close() error {
+	var firstErr error
 	if s.client != nil {
-		return s.client.Close()
+		firstErr = s.client.Close()
 	}
-	return nil
+	s.winMu.Lock()
+	winClient := s.winClient
+	s.winClient = nil
+	s.winMu.Unlock()
+	if winClient != nil {
+		if err := winClient.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *ShadowQuic) ProxyInfo() C.ProxyInfo {
@@ -188,6 +215,24 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
 			return quicConn, nil
 		},
 	})
+	outbound.newWinClient = func() *shadowquic.Client {
+		return shadowquic.NewClient(&shadowquic.ClientOption{
+			UDPOverStream:        option.UDPOverStream,
+			CongestionController: option.CongestionController,
+			SendBPS:              utils.StringToBps(option.Up),
+			ReceiveBPS:           utils.StringToBps(option.Down),
+			CWND:                 option.CWND,
+			BBRProfile:           option.BBRProfile,
+			Dial: func(ctx context.Context) (*quic.Conn, error) {
+				ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+				_, quicConn, err := shadowquic.DialQuic(ctx, outbound.addr, outbound.DialOptions(), outbound.dialer, outbound.tlsConfig, outbound.quicConfig, shadowquic.DialQuicOption{Early: option.ZeroRTT})
+				if err != nil {
+					return nil, err
+				}
+				return quicConn, nil
+			},
+		})
+	}
 
 	return outbound, nil
 }

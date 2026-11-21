@@ -7,9 +7,11 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
@@ -31,7 +33,10 @@ type Trojan struct {
 	hexPassword [trojan.KeyLength]byte
 
 	// for gun mux
-	gunClient *gun.Client
+	gunClient       *gun.Client
+	winGunMu        sync.Mutex
+	winGunClient    *gun.Client
+	newWinGunClient func() *gun.Client
 
 	echConfig       *ech.Config
 	shadowTLSConfig *shadowtls.Config
@@ -207,10 +212,22 @@ func (t *Trojan) writeHeaderContext(ctx context.Context, c net.Conn, metadata *C
 	return err
 }
 
+func (t *Trojan) selectGunClient(ctx context.Context) *gun.Client {
+	if !isWindowsTTLContext(ctx) || t.newWinGunClient == nil {
+		return t.gunClient
+	}
+	t.winGunMu.Lock()
+	defer t.winGunMu.Unlock()
+	if t.winGunClient == nil {
+		t.winGunClient = t.newWinGunClient()
+	}
+	return t.winGunClient
+}
+
 func (t *Trojan) dialContext(ctx context.Context) (c net.Conn, err error) {
 	switch t.option.Network {
 	case "grpc": // gun transport
-		return t.gunClient.Dial()
+		return t.selectGunClient(ctx).Dial()
 	default:
 	}
 	return t.dialer.DialContext(ctx, "tcp", t.addr)
@@ -274,6 +291,15 @@ func (t *Trojan) Close() error {
 	var errs []error
 	if t.gunClient != nil {
 		if err := t.gunClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	t.winGunMu.Lock()
+	winGun := t.winGunClient
+	t.winGunClient = nil
+	t.winGunMu.Unlock()
+	if winGun != nil {
+		if err := winGun.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -397,6 +423,19 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 			option.GrpcOpts.MinStreams,
 			option.GrpcOpts.MaxStreams,
 		)
+		winDialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialFn(dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL), network, addr)
+		}
+		t.newWinGunClient = func() *gun.Client {
+			return gun.NewClient(
+				func() *gun.Transport {
+					return gun.NewTransport(winDialFn, tlsConfig, gunConfig)
+				},
+				option.GrpcOpts.MaxConnections,
+				option.GrpcOpts.MinStreams,
+				option.GrpcOpts.MaxStreams,
+			)
+		}
 	}
 
 	return t, nil

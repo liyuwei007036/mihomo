@@ -83,6 +83,9 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 	if err != nil {
 		return nil, err
 	}
+	if ttl := InitialTTLFromContext(ctx); ttl > 0 {
+		bindTTLToListenConfig(ttl, lc)
+	}
 	return lc.ListenPacket(ctx, network, address)
 }
 
@@ -183,8 +186,17 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
 		if opt.routingMark != 0 {
 			bindMarkToDialer(opt.routingMark, dialer, network, destination)
 		}
+		if ttl := InitialTTLFromContext(ctx); ttl > 0 {
+			bindTTLToDialer(ttl, dialer)
+		}
 		if opt.tfo && !DisableTFO {
 			return dialTFO(ctx, *dialer, network, address)
+		}
+	}
+
+	if DefaultSocketHook != nil {
+		if ttl := InitialTTLFromContext(ctx); ttl > 0 {
+			bindTTLToDialer(ttl, dialer)
 		}
 	}
 

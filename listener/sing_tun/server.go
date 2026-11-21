@@ -307,6 +307,9 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		dnsAdds = append(dnsAdds, addrPort)
 	}
 
+	tracker := newTTLTracker()
+	additions = append(additions, tracker.Addition())
+
 	h, err := sing.NewListenerHandler(sing.ListenerConfig{
 		Tunnel:    tunnel,
 		Type:      C.TUN,
@@ -492,6 +495,8 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	l.dnsServerIp = dnsServerIp
 	// after tun.New sing-tun has set DNS to TUN interface
 	resolver.AddSystemDnsBlacklist(dnsServerIp...)
+
+	tunIf = wrapTunWithTTLTracker(tunIf, tracker)
 
 	stackOptions := tun.StackOptions{
 		Context:                ctx,

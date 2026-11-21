@@ -7,11 +7,13 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -32,8 +34,11 @@ const defaultHopInterval = 30
 type Hysteria2 struct {
 	*Base
 
-	option *Hysteria2Option
-	client *hysteria2.Client
+	option       *Hysteria2Option
+	client       *hysteria2.Client
+	winMu        sync.Mutex
+	winClient    *hysteria2.Client
+	newWinClient func() (*hysteria2.Client, error)
 }
 
 type Hysteria2Option struct {
@@ -89,8 +94,28 @@ type Hysteria2RealmOption struct {
 	ALPN           []string `proxy:"alpn,omitempty"`
 }
 
+func (h *Hysteria2) selectClient(ctx context.Context) (*hysteria2.Client, error) {
+	if !isWindowsTTLContext(ctx) || h.newWinClient == nil {
+		return h.client, nil
+	}
+	h.winMu.Lock()
+	defer h.winMu.Unlock()
+	if h.winClient == nil {
+		c, err := h.newWinClient()
+		if err != nil {
+			return nil, err
+		}
+		h.winClient = c
+	}
+	return h.winClient, nil
+}
+
 func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	c, err := h.client.DialConn(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+	client, err := h.selectClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c, err := client.DialConn(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +126,11 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if err = h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	pc, err := h.client.ListenPacket(ctx)
+	client, err := h.selectClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pc, err := client.ListenPacket(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -113,10 +142,22 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 
 // Close implements C.ProxyAdapter
 func (h *Hysteria2) Close() error {
+	var errs []error
 	if h.client != nil {
-		return h.client.CloseWithError(errors.New("proxy removed"))
+		if err := h.client.CloseWithError(errors.New("proxy removed")); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	h.winMu.Lock()
+	winClient := h.winClient
+	h.winClient = nil
+	h.winMu.Unlock()
+	if winClient != nil {
+		if err := winClient.CloseWithError(errors.New("proxy removed")); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ProxyInfo implements C.ProxyAdapter
@@ -316,6 +357,20 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		return nil, err
 	}
 	outbound.client = client
+	outbound.newWinClient = func() (*hysteria2.Client, error) {
+		winOptions := clientOptions
+		winOptions.TLSConfig = tlsClientConfig.Clone()
+		winDialer := wrapDialerWithTTL(outbound.dialer, dialer.WindowsInitialTTL)
+		winOptions.PacketListener = winDialer
+		winOptions.QuicDialer = qtls.QuicDialerFunc(func(ctx context.Context, addr string, pktDialer qtls.PacketDialer, tlsCfg *tls.Config, cfg *quic.Config, early bool) (net.PacketConn, *quic.Conn, error) {
+			ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+			if err := echConfig.ClientHandle(ctx, tlsCfg); err != nil {
+				return nil, nil, err
+			}
+			return common.DialQuic(ctx, addr, outbound.DialOptions(), pktDialer, tlsCfg, cfg, common.DialQuicOption{Early: early})
+		})
+		return hysteria2.NewClient(winOptions)
+	}
 
 	return outbound, nil
 }
