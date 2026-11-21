@@ -73,18 +73,23 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           GOAMD64: ${{ matrix.goamd64 }}
         run: |
-          mkdir -p dist
+          mkdir -p dist/tar
           go build -v -tags "with_gvisor" -trimpath \
             -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${{ steps.ver.outputs.VERSION }}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${{ steps.ver.outputs.BUILDTIME }}' -w -s -buildid=" \
             -o dist/mihomo .
           gzip -9 -c dist/mihomo > "dist/mihomo-linux-${{ matrix.arch }}-${{ steps.ver.outputs.VERSION }}.gz"
-          rm -f dist/mihomo
+          cp dist/mihomo dist/tar/clash
+          chmod +x dist/tar/clash
+          tar -czf "dist/clash-linux-${{ matrix.arch }}.tar.gz" -C dist/tar clash
+          rm -rf dist/mihomo dist/tar
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: mihomo-linux-${{ matrix.arch }}
-          path: dist/mihomo-linux-${{ matrix.arch }}-${{ steps.ver.outputs.VERSION }}.gz
+          path: |
+            dist/mihomo-linux-${{ matrix.arch }}-${{ steps.ver.outputs.VERSION }}.gz
+            dist/clash-linux-${{ matrix.arch }}.tar.gz
 
   publish:
     name: Publish GitHub Release
@@ -114,7 +119,7 @@ jobs:
       - name: Generate Checksums
         run: |
           cd release-assets
-          sha256sum *.gz > sha256sums.txt
+          sha256sum *.gz *.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
       - name: Create or Update GitHub Release
