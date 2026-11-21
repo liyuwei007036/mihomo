@@ -22,7 +22,7 @@ type ttlTrackingNetworkDispatcher struct {
 
 func (d *ttlTrackingNetworkDispatcher) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	if pkt != nil {
-		var hdrBuf [64]byte
+		var hdrBuf [128]byte
 		copied := 0
 		for _, slice := range pkt.AsSlices() {
 			if copied >= len(hdrBuf) {

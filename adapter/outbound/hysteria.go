@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
@@ -44,30 +43,16 @@ const (
 type Hysteria struct {
 	*Base
 
-	option       *HysteriaOption
-	client       *core.Client
-	winMu        sync.Mutex
-	winClient    *core.Client
-	newWinClient func() (*core.Client, error)
+	option  *HysteriaOption
+	client  *core.Client
+	ttlPool ttlClientPool[*core.Client]
 
 	tlsConfig *tls.Config
 	echConfig *ech.Config
 }
 
 func (h *Hysteria) selectClient(ctx context.Context) (*core.Client, error) {
-	if !isWindowsTTLContext(ctx) || h.newWinClient == nil {
-		return h.client, nil
-	}
-	h.winMu.Lock()
-	defer h.winMu.Unlock()
-	if h.winClient == nil {
-		c, err := h.newWinClient()
-		if err != nil {
-			return nil, err
-		}
-		h.winClient = c
-	}
-	return h.winClient, nil
+	return h.ttlPool.get(ctx, h.client)
 }
 
 func (h *Hysteria) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
@@ -285,14 +270,14 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 		client:    client,
 		tlsConfig: tlsClientConfig,
 		echConfig: echConfig,
-		newWinClient: func() (*core.Client, error) {
-			return core.NewClient(
-				addr, ports, option.Protocol, auth, tlsClientConfig.Clone(), quicConfig, clientTransport, up, down, func(refBPS uint64) congestion.CongestionControl {
-					return hyCongestion.NewBrutalSender(congestion.ByteCount(refBPS))
-				}, obfuscator, hopInterval, option.FastOpen,
-			)
-		},
 	}
+	outbound.ttlPool.init(func(ttl int) (*core.Client, error) {
+		return core.NewClient(
+			addr, ports, option.Protocol, auth, tlsClientConfig.Clone(), quicConfig, clientTransport, up, down, func(refBPS uint64) congestion.CongestionControl {
+				return hyCongestion.NewBrutalSender(congestion.ByteCount(refBPS))
+			}, obfuscator, hopInterval, option.FastOpen,
+		)
+	})
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 
 	return outbound, nil
@@ -304,13 +289,11 @@ func (h *Hysteria) Close() error {
 	if h.client != nil {
 		firstErr = h.client.Close()
 	}
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winClient = nil
-	h.winMu.Unlock()
-	if winClient != nil {
-		if err := winClient.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	for _, c := range h.ttlPool.takeAll() {
+		if c != nil {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr

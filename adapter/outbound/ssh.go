@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/metacubex/randv2"
@@ -23,10 +24,10 @@ type Ssh struct {
 
 	option *SshOption
 
-	config    *ssh.ClientConfig
-	client    *ssh.Client
-	winClient *ssh.Client
-	cMutex    sync.Mutex
+	config     *ssh.ClientConfig
+	client     *ssh.Client
+	ttlClients map[int]*ssh.Client
+	cMutex     sync.Mutex
 }
 
 type SshOption struct {
@@ -56,12 +57,12 @@ func (s *Ssh) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, 
 }
 
 func (s *Ssh) connect(ctx context.Context, addr string) (client *ssh.Client, err error) {
-	isWin := isWindowsTTLContext(ctx)
+	ttl := dialer.InitialTTLFromContext(ctx)
 	s.cMutex.Lock()
 	defer s.cMutex.Unlock()
-	if isWin {
-		if s.winClient != nil {
-			return s.winClient, nil
+	if ttl > 0 {
+		if c := s.ttlClients[ttl]; c != nil {
+			return c, nil
 		}
 	} else if s.client != nil {
 		return s.client, nil
@@ -93,8 +94,11 @@ func (s *Ssh) connect(ctx context.Context, addr string) (client *ssh.Client, err
 	}
 	client = ssh.NewClient(clientConn, chans, reqs)
 
-	if isWin {
-		s.winClient = client
+	if ttl > 0 {
+		if s.ttlClients == nil {
+			s.ttlClients = make(map[int]*ssh.Client, 2)
+		}
+		s.ttlClients[ttl] = client
 	} else {
 		s.client = client
 	}
@@ -104,9 +108,9 @@ func (s *Ssh) connect(ctx context.Context, addr string) (client *ssh.Client, err
 		_ = client.Close()
 		s.cMutex.Lock()
 		defer s.cMutex.Unlock()
-		if isWin {
-			if s.winClient == client {
-				s.winClient = nil
+		if ttl > 0 {
+			if s.ttlClients[ttl] == client {
+				delete(s.ttlClients, ttl)
 			}
 		} else if s.client == client {
 			s.client = nil
@@ -139,10 +143,19 @@ func (s *Ssh) ProxyInfo() C.ProxyInfo {
 func (s *Ssh) Close() error {
 	s.cMutex.Lock()
 	defer s.cMutex.Unlock()
+	var firstErr error
 	if s.client != nil {
-		return s.client.Close()
+		firstErr = s.client.Close()
 	}
-	return nil
+	for k, c := range s.ttlClients {
+		if c != nil {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		delete(s.ttlClients, k)
+	}
+	return firstErr
 }
 
 func NewSsh(option SshOption) (*Ssh, error) {

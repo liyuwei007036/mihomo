@@ -41,11 +41,9 @@ type Vmess struct {
 	option *VmessOption
 
 	// for gun mux
-	gunClient       *gun.Client
-	winGunMu        sync.Mutex
-	winGunClient    *gun.Client
-	newWinGunClient func() *gun.Client
-	mekyaClient     *mekya.Client
+	gunClient   *gun.Client
+	gunTTLPool  ttlClientPool[*gun.Client]
+	mekyaClient *mekya.Client
 
 	echConfig       *ech.Config
 	shadowTLSConfig *shadowtls.Config
@@ -384,15 +382,7 @@ func (v *Vmess) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 }
 
 func (v *Vmess) selectGunClient(ctx context.Context) *gun.Client {
-	if !isWindowsTTLContext(ctx) || v.newWinGunClient == nil {
-		return v.gunClient
-	}
-	v.winGunMu.Lock()
-	defer v.winGunMu.Unlock()
-	if v.winGunClient == nil {
-		v.winGunClient = v.newWinGunClient()
-	}
-	return v.winGunClient
+	return v.gunTTLPool.getNoErr(ctx, v.gunClient)
 }
 
 func (v *Vmess) dialContext(ctx context.Context) (c net.Conn, err error) {
@@ -475,13 +465,11 @@ func (v *Vmess) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	v.winGunMu.Lock()
-	winGun := v.winGunClient
-	v.winGunClient = nil
-	v.winGunMu.Unlock()
-	if winGun != nil {
-		if err := winGun.Close(); err != nil {
-			errs = append(errs, err)
+	for _, c := range v.gunTTLPool.takeAll() {
+		if c != nil {
+			if err := c.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if v.mekyaClient != nil {
@@ -673,19 +661,19 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 			option.GrpcOpts.MinStreams,
 			option.GrpcOpts.MaxStreams,
 		)
-		winDialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialFn(dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL), network, addr)
-		}
-		v.newWinGunClient = func() *gun.Client {
+		v.gunTTLPool.init(func(ttl int) (*gun.Client, error) {
+			ttlDialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialFn(dialer.WithInitialTTL(ctx, ttl), network, addr)
+			}
 			return gun.NewClient(
 				func() *gun.Transport {
-					return gun.NewTransport(winDialFn, tlsConfig, gunConfig)
+					return gun.NewTransport(ttlDialFn, tlsConfig, gunConfig)
 				},
 				option.GrpcOpts.MaxConnections,
 				option.GrpcOpts.MinStreams,
 				option.GrpcOpts.MaxStreams,
-			)
-		}
+			), nil
+		})
 	}
 
 	return v, nil

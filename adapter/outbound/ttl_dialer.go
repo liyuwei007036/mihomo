@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
@@ -11,8 +12,73 @@ import (
 	singN "github.com/metacubex/sing/common/network"
 )
 
-func isWindowsTTLContext(ctx context.Context) bool {
-	return dialer.InitialTTLFromContext(ctx) == dialer.WindowsInitialTTL
+// ttlClientPool lazily creates and caches companion multiplexed clients keyed
+// by non-zero initial TTL (e.g., 128 for Windows, 255 for Apple macOS/iOS) so
+// multiplexed transports never mix OS fingerprints on the same outer socket.
+type ttlClientPool[T any] struct {
+	mu      sync.Mutex
+	clients map[int]T
+	factory func(ttl int) (T, error)
+}
+
+func (p *ttlClientPool[T]) init(factory func(ttl int) (T, error)) {
+	p.factory = factory
+}
+
+func (p *ttlClientPool[T]) get(ctx context.Context, fallback T) (T, error) {
+	ttl := dialer.InitialTTLFromContext(ctx)
+	if ttl <= 0 || p.factory == nil {
+		return fallback, nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.clients == nil {
+		p.clients = make(map[int]T, 2)
+	}
+	if c, ok := p.clients[ttl]; ok {
+		return c, nil
+	}
+	c, err := p.factory(ttl)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	p.clients[ttl] = c
+	return c, nil
+}
+
+func (p *ttlClientPool[T]) getNoErr(ctx context.Context, fallback T) T {
+	c, err := p.get(ctx, fallback)
+	if err != nil {
+		return fallback
+	}
+	return c
+}
+
+func (p *ttlClientPool[T]) takeAll() []T {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.clients) == 0 {
+		return nil
+	}
+	out := make([]T, 0, len(p.clients))
+	for _, c := range p.clients {
+		out = append(out, c)
+	}
+	p.clients = nil
+	return out
+}
+
+func (p *ttlClientPool[T]) forEach(fn func(T)) {
+	p.mu.Lock()
+	snapshot := make([]T, 0, len(p.clients))
+	for _, c := range p.clients {
+		snapshot = append(snapshot, c)
+	}
+	p.mu.Unlock()
+	for _, c := range snapshot {
+		fn(c)
+	}
 }
 
 // ttlProxyDialer wraps a C.Dialer so every outbound socket dialed through it

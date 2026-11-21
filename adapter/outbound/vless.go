@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/convert"
@@ -46,15 +45,11 @@ type Vless struct {
 	encryption *encryption.ClientInstance
 
 	// for gun mux
-	gunClient       *gun.Client
-	winGunMu        sync.Mutex
-	winGunClient    *gun.Client
-	newWinGunClient func() *gun.Client
+	gunClient  *gun.Client
+	gunTTLPool ttlClientPool[*gun.Client]
 	// for xhttp
-	xhttpClient       *xhttp.Client
-	winXHTTPMu        sync.Mutex
-	winXHTTPClient    *xhttp.Client
-	newWinXHTTPClient func() (*xhttp.Client, error)
+	xhttpClient  *xhttp.Client
+	xhttpTTLPool ttlClientPool[*xhttp.Client]
 
 	echConfig       *ech.Config
 	shadowTLSConfig *shadowtls.Config
@@ -346,31 +341,11 @@ func (v *Vless) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 }
 
 func (v *Vless) selectGunClient(ctx context.Context) *gun.Client {
-	if !isWindowsTTLContext(ctx) || v.newWinGunClient == nil {
-		return v.gunClient
-	}
-	v.winGunMu.Lock()
-	defer v.winGunMu.Unlock()
-	if v.winGunClient == nil {
-		v.winGunClient = v.newWinGunClient()
-	}
-	return v.winGunClient
+	return v.gunTTLPool.getNoErr(ctx, v.gunClient)
 }
 
 func (v *Vless) selectXHTTPClient(ctx context.Context) (*xhttp.Client, error) {
-	if !isWindowsTTLContext(ctx) || v.newWinXHTTPClient == nil {
-		return v.xhttpClient, nil
-	}
-	v.winXHTTPMu.Lock()
-	defer v.winXHTTPMu.Unlock()
-	if v.winXHTTPClient == nil {
-		c, err := v.newWinXHTTPClient()
-		if err != nil {
-			return nil, err
-		}
-		v.winXHTTPClient = c
-	}
-	return v.winXHTTPClient, nil
+	return v.xhttpTTLPool.get(ctx, v.xhttpClient)
 }
 
 func (v *Vless) dialContext(ctx context.Context) (c net.Conn, err error) {
@@ -463,13 +438,11 @@ func (v *Vless) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	v.winGunMu.Lock()
-	winGun := v.winGunClient
-	v.winGunClient = nil
-	v.winGunMu.Unlock()
-	if winGun != nil {
-		if err := winGun.Close(); err != nil {
-			errs = append(errs, err)
+	for _, c := range v.gunTTLPool.takeAll() {
+		if c != nil {
+			if err := c.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if v.xhttpClient != nil {
@@ -477,13 +450,11 @@ func (v *Vless) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	v.winXHTTPMu.Lock()
-	winXHTTP := v.winXHTTPClient
-	v.winXHTTPClient = nil
-	v.winXHTTPMu.Unlock()
-	if winXHTTP != nil {
-		if err := winXHTTP.Close(); err != nil {
-			errs = append(errs, err)
+	for _, c := range v.xhttpTTLPool.takeAll() {
+		if c != nil {
+			if err := c.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -669,19 +640,19 @@ func NewVless(option VlessOption) (*Vless, error) {
 			option.GrpcOpts.MinStreams,
 			option.GrpcOpts.MaxStreams,
 		)
-		winDialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialFn(dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL), network, addr)
-		}
-		v.newWinGunClient = func() *gun.Client {
+		v.gunTTLPool.init(func(ttl int) (*gun.Client, error) {
+			ttlDialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialFn(dialer.WithInitialTTL(ctx, ttl), network, addr)
+			}
 			return gun.NewClient(
 				func() *gun.Transport {
-					return gun.NewTransport(winDialFn, tlsConfig, gunConfig)
+					return gun.NewTransport(ttlDialFn, tlsConfig, gunConfig)
 				},
 				option.GrpcOpts.MaxConnections,
 				option.GrpcOpts.MinStreams,
 				option.GrpcOpts.MaxStreams,
-			)
-		}
+			), nil
+		})
 	case "xhttp":
 		requestHost := v.option.XHTTPOpts.Host
 		if requestHost == "" {
@@ -986,10 +957,10 @@ func NewVless(option VlessOption) (*Vless, error) {
 		if err != nil {
 			return nil, err
 		}
-		v.newWinXHTTPClient = func() (*xhttp.Client, error) {
-			winDialer := wrapDialerWithTTL(v.dialer, dialer.WindowsInitialTTL)
-			return xhttp.NewClient(cfg, makeTransportFor(winDialer), makeDownloadTransport, v.realityConfig != nil)
-		}
+		v.xhttpTTLPool.init(func(ttl int) (*xhttp.Client, error) {
+			ttlDialer := wrapDialerWithTTL(v.dialer, ttl)
+			return xhttp.NewClient(cfg, makeTransportFor(ttlDialer), makeDownloadTransport, v.realityConfig != nil)
+		})
 	}
 
 	return v, nil

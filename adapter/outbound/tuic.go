@@ -6,7 +6,6 @@ import (
 	"math"
 	"net"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
@@ -25,11 +24,9 @@ import (
 
 type Tuic struct {
 	*Base
-	option       *TuicOption
-	client       *tuic.PoolClient
-	winMu        sync.Mutex
-	winClient    *tuic.PoolClient
-	newWinClient func() *tuic.PoolClient
+	option  *TuicOption
+	client  *tuic.PoolClient
+	ttlPool ttlClientPool[*tuic.PoolClient]
 
 	quicConfig *quic.Config
 	tlsConfig  *tls.Config
@@ -75,15 +72,7 @@ type TuicOption struct {
 }
 
 func (t *Tuic) selectClient(ctx context.Context) *tuic.PoolClient {
-	if !isWindowsTTLContext(ctx) || t.newWinClient == nil {
-		return t.client
-	}
-	t.winMu.Lock()
-	defer t.winMu.Unlock()
-	if t.winClient == nil {
-		t.winClient = t.newWinClient()
-	}
-	return t.winClient
+	return t.ttlPool.getNoErr(ctx, t.client)
 }
 
 // DialContext implements C.ProxyAdapter
@@ -136,9 +125,10 @@ func (t *Tuic) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
 	return quicConn, nil
 }
 
-func (t *Tuic) dialWindows(ctx context.Context) (quicConn *quic.Conn, err error) {
-	ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
-	return t.dial(ctx)
+func (t *Tuic) dialWithTTL(ttl int) func(context.Context) (*quic.Conn, error) {
+	return func(ctx context.Context) (*quic.Conn, error) {
+		return t.dial(dialer.WithInitialTTL(ctx, ttl))
+	}
 }
 
 // ProxyInfo implements C.ProxyAdapter
@@ -302,9 +292,9 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		}
 
 		t.client = tuic.NewPoolClientV4(clientOption, t.dial)
-		t.newWinClient = func() *tuic.PoolClient {
-			return tuic.NewPoolClientV4(clientOption, t.dialWindows)
-		}
+		t.ttlPool.init(func(ttl int) (*tuic.PoolClient, error) {
+			return tuic.NewPoolClientV4(clientOption, t.dialWithTTL(ttl)), nil
+		})
 	} else {
 		maxUdpRelayPacketSize := option.MaxUdpRelayPacketSize
 		if maxUdpRelayPacketSize > tuic.MaxFragSizeV5 {
@@ -319,9 +309,9 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		}
 
 		t.client = tuic.NewPoolClientV5(clientOption, t.dial)
-		t.newWinClient = func() *tuic.PoolClient {
-			return tuic.NewPoolClientV5(clientOption, t.dialWindows)
-		}
+		t.ttlPool.init(func(ttl int) (*tuic.PoolClient, error) {
+			return tuic.NewPoolClientV5(clientOption, t.dialWithTTL(ttl)), nil
+		})
 	}
 
 	return t, nil

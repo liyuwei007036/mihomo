@@ -2,11 +2,9 @@ package outbound
 
 import (
 	"context"
-	"sync"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
-	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -18,11 +16,9 @@ import (
 
 type SingMux struct {
 	ProxyAdapter
-	client       *mux.Client
-	winMu        sync.Mutex
-	winClient    *mux.Client
-	newWinClient func() (*mux.Client, error)
-	onlyTcp      bool
+	client  *mux.Client
+	ttlPool ttlClientPool[*mux.Client]
+	onlyTcp bool
 }
 
 type SingMuxOption struct {
@@ -44,19 +40,7 @@ type BrutalOption struct {
 }
 
 func (s *SingMux) selectClient(ctx context.Context) (*mux.Client, error) {
-	if !isWindowsTTLContext(ctx) || s.newWinClient == nil {
-		return s.client, nil
-	}
-	s.winMu.Lock()
-	defer s.winMu.Unlock()
-	if s.winClient == nil {
-		c, err := s.newWinClient()
-		if err != nil {
-			return nil, err
-		}
-		s.winClient = c
-	}
-	return s.winClient, nil
+	return s.ttlPool.get(ctx, s.client)
 }
 
 func (s *SingMux) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
@@ -117,12 +101,10 @@ func (s *SingMux) Close() error {
 	if s.client != nil {
 		_ = s.client.Close()
 	}
-	s.winMu.Lock()
-	winClient := s.winClient
-	s.winClient = nil
-	s.winMu.Unlock()
-	if winClient != nil {
-		_ = winClient.Close()
+	for _, c := range s.ttlPool.takeAll() {
+		if c != nil {
+			_ = c.Close()
+		}
 	}
 	return s.ProxyAdapter.Close()
 }
@@ -154,12 +136,12 @@ func NewSingMux(option SingMuxOption, proxy ProxyAdapter) (ProxyAdapter, error) 
 	outbound := &SingMux{
 		ProxyAdapter: proxy,
 		client:       client,
-		newWinClient: func() (*mux.Client, error) {
-			winOpts := muxOpts
-			winOpts.Dialer = wrapSingDialerWithTTL(singDialer, dialer.WindowsInitialTTL)
-			return mux.NewClient(winOpts)
-		},
-		onlyTcp: option.OnlyTcp,
+		onlyTcp:      option.OnlyTcp,
 	}
+	outbound.ttlPool.init(func(ttl int) (*mux.Client, error) {
+		ttlOpts := muxOpts
+		ttlOpts.Dialer = wrapSingDialerWithTTL(singDialer, ttl)
+		return mux.NewClient(ttlOpts)
+	})
 	return outbound, nil
 }

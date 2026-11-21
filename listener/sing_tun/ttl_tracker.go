@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
+	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
 	tun "github.com/metacubex/sing-tun"
 )
@@ -18,6 +19,9 @@ const (
 	ttlTrackerMaxHosts  = 1024
 	windowsTTLMin       = 65
 	windowsTTLMax       = 128
+	linuxRelayTTLMin    = 129
+	linuxRelayTTLMax    = 192
+	appleRelayTTLMin    = 193
 	ipv4MinHeaderLength = 20
 	ipv6HeaderLength    = 40
 	protoTCP            = 6
@@ -33,15 +37,17 @@ type ttlFlowKey struct {
 }
 
 type ttlRecord struct {
-	isWindows bool
-	seenAt    time.Time
+	relayTTL uint8
+	seenAt   time.Time
 }
 
-// ttlTracker records the raw IPv4 TTL / IPv6 Hop Limit of packets arriving on
-// the TUN interface before the stack (system / mixed / gvisor) rewrites or
-// terminates them in the kernel. LAN Windows hosts emit initial TTL 128
-// (65..128 after optional intermediate hops), whereas Linux/macOS/iOS/Android
-// emit initial TTL <= 64.
+// ttlTracker records the originating OS class from raw L3/L4 headers arriving
+// on the TUN interface before the stack (system / mixed / gvisor) terminates
+// them in the kernel:
+//   - Windows hosts emit initial TTL 128 (65..128) -> relayTTL = 128
+//   - Apple macOS/iOS hosts emit TTL 64 + XNU TCP SYN options [2,1,3,1,1,8]
+//     (or upstream relayed TTL >= 129) -> relayTTL = 255
+//   - Linux/Android hosts emit TTL 64 + Linux TCP options -> relayTTL = 0
 type ttlTracker struct {
 	mu          sync.RWMutex
 	flows       map[ttlFlowKey]ttlRecord
@@ -57,8 +63,62 @@ func newTTLTracker() *ttlTracker {
 	}
 }
 
-func isWindowsInitialTTL(ttl uint8) bool {
-	return ttl >= windowsTTLMin && ttl <= windowsTTLMax
+// isAppleTCPSYNOptions reports whether a TCP header carries the characteristic
+// Apple XNU (macOS / iOS / iPadOS) SYN option prefix:
+// MSS(2), NOP(1), WS(3), NOP(1), NOP(1), TS(8) [, SACK_PERM(4), EOL(0), EOL(0)].
+func isAppleTCPSYNOptions(tcpHeader []byte) bool {
+	if len(tcpHeader) < 20 {
+		return false
+	}
+	dataOffset := int(tcpHeader[12]>>4) * 4
+	if dataOffset <= 20 {
+		return false
+	}
+	if dataOffset > len(tcpHeader) {
+		dataOffset = len(tcpHeader)
+	}
+	opts := tcpHeader[20:dataOffset]
+	want := [6]byte{2, 1, 3, 1, 1, 8}
+	matched := 0
+	for i := 0; i < len(opts) && matched < len(want); {
+		kind := opts[i]
+		if kind == 0 || kind != want[matched] {
+			return false
+		}
+		matched++
+		if kind == 1 {
+			i++
+			continue
+		}
+		if i+1 >= len(opts) {
+			return false
+		}
+		optLen := int(opts[i+1])
+		if optLen < 2 || i+optLen > len(opts) {
+			return false
+		}
+		i += optLen
+	}
+	return matched == len(want)
+}
+
+func classifyPacketRelayTTL(ttl uint8, proto uint8, l4 []byte) uint8 {
+	if ttl >= windowsTTLMin && ttl <= windowsTTLMax {
+		return dialer.WindowsInitialTTL
+	}
+	if ttl >= appleRelayTTLMin {
+		return dialer.AppleRelayTTL
+	}
+	if ttl >= linuxRelayTTLMin && ttl <= linuxRelayTTLMax {
+		return dialer.LinuxRelayTTL
+	}
+	if proto == protoTCP {
+		if isAppleTCPSYNOptions(l4) {
+			return dialer.AppleRelayTTL
+		}
+		return dialer.LinuxRelayTTL
+	}
+	return 0
 }
 
 func (t *ttlTracker) observePacket(packet []byte) {
@@ -106,7 +166,7 @@ func (t *ttlTracker) observePacket(packet []byte) {
 			return
 		}
 	}
-	isWin := isWindowsInitialTTL(ttl)
+	relayTTL := classifyPacketRelayTTL(ttl, proto, packet[l4Offset:])
 	now := time.Now()
 
 	var (
@@ -124,25 +184,38 @@ func (t *ttlTracker) observePacket(packet []byte) {
 		hasFlow = true
 	}
 
-	// Fast path: skip acquiring the write lock for already-tracked flows seen
-	// within the last 5 seconds with the same OS classification.
+	// Fast path: inherit host-level Apple/Linux classification for UDP packets
+	// from an already-classified host (UDP carries TTL=64 with no TCP options),
+	// and skip acquiring the write lock when flow/host state is already fresh.
 	t.mu.RLock()
-	if hasFlow {
-		if rec, ok := t.flows[key]; ok && rec.isWindows == isWin && now.Sub(rec.seenAt) < 5*time.Second {
-			t.mu.RUnlock()
-			return
+	if proto == protoUDP && relayTTL == 0 {
+		if hrec, ok := t.hosts[srcIP]; ok && (hrec.relayTTL == dialer.AppleRelayTTL || hrec.relayTTL == dialer.LinuxRelayTTL) && now.Sub(hrec.seenAt) <= ttlTrackerEntryTTL {
+			relayTTL = hrec.relayTTL
 		}
-	} else if rec, ok := t.hosts[srcIP]; ok && rec.isWindows == isWin && now.Sub(rec.seenAt) < 5*time.Second {
+	}
+	if hasFlow {
+		if rec, ok := t.flows[key]; ok && rec.relayTTL == relayTTL && now.Sub(rec.seenAt) < 5*time.Second {
+			if hrec, hok := t.hosts[srcIP]; hok && hrec.relayTTL == relayTTL && now.Sub(hrec.seenAt) < 5*time.Second {
+				t.mu.RUnlock()
+				return
+			}
+		}
+	} else if rec, ok := t.hosts[srcIP]; ok && rec.relayTTL == relayTTL && now.Sub(rec.seenAt) < 5*time.Second {
 		t.mu.RUnlock()
 		return
 	}
 	t.mu.RUnlock()
 
 	t.mu.Lock()
-	if hasFlow {
-		t.flows[key] = ttlRecord{isWindows: isWin, seenAt: now}
+	if proto == protoUDP && relayTTL == 0 {
+		if hrec, ok := t.hosts[srcIP]; ok && (hrec.relayTTL == dialer.AppleRelayTTL || hrec.relayTTL == dialer.LinuxRelayTTL) && now.Sub(hrec.seenAt) <= ttlTrackerEntryTTL {
+			relayTTL = hrec.relayTTL
+		}
 	}
-	t.hosts[srcIP] = ttlRecord{isWindows: isWin, seenAt: now}
+	if hasFlow {
+		t.flows[key] = ttlRecord{relayTTL: relayTTL, seenAt: now}
+	}
+	t.hosts[srcIP] = ttlRecord{relayTTL: relayTTL, seenAt: now}
 	if len(t.flows) > ttlTrackerMaxFlows || len(t.hosts) > ttlTrackerMaxHosts || now.Sub(t.lastCleanup) > ttlTrackerEntryTTL {
 		t.cleanupLocked(now)
 	}
@@ -195,19 +268,22 @@ func (t *ttlTracker) cleanupLocked(now time.Time) {
 	}
 }
 
-func (t *ttlTracker) isWindows(metadata *C.Metadata) bool {
+func (t *ttlTracker) relayTTL(metadata *C.Metadata) uint8 {
 	if runtime.GOOS == "windows" {
-		return true
+		return dialer.WindowsInitialTTL
+	}
+	if runtime.GOOS == "darwin" {
+		return dialer.AppleRelayTTL
 	}
 	if metadata == nil {
-		return false
+		return 0
 	}
 	if metadata.DSCP == 1 {
-		return true
+		return dialer.WindowsInitialTTL
 	}
 	srcIP := metadata.SrcIP.Unmap()
 	if !srcIP.IsValid() {
-		return false
+		return 0
 	}
 	var proto uint8
 	switch metadata.NetWork {
@@ -229,19 +305,19 @@ func (t *ttlTracker) isWindows(metadata *C.Metadata) bool {
 			dstPort: metadata.DstPort,
 		}
 		if rec, ok := t.flows[key]; ok && now.Sub(rec.seenAt) <= ttlTrackerEntryTTL {
-			return rec.isWindows
+			return rec.relayTTL
 		}
 	}
 	if rec, ok := t.hosts[srcIP]; ok && now.Sub(rec.seenAt) <= ttlTrackerEntryTTL {
-		return rec.isWindows
+		return rec.relayTTL
 	}
-	return false
+	return 0
 }
 
 func (t *ttlTracker) Addition() inbound.Addition {
 	return func(metadata *C.Metadata) {
-		if t.isWindows(metadata) {
-			metadata.IsWindows = true
+		if ttl := t.relayTTL(metadata); ttl > 0 {
+			metadata.InitialTTL = ttl
 		}
 	}
 }

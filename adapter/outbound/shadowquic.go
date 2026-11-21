@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
@@ -21,11 +20,9 @@ import (
 
 type ShadowQuic struct {
 	*Base
-	option       *ShadowQuicOption
-	client       *shadowquic.Client
-	winMu        sync.Mutex
-	winClient    *shadowquic.Client
-	newWinClient func() *shadowquic.Client
+	option  *ShadowQuicOption
+	client  *shadowquic.Client
+	ttlPool ttlClientPool[*shadowquic.Client]
 
 	quicConfig *quic.Config
 	tlsConfig  *tls.Config
@@ -57,15 +54,7 @@ type ShadowQuicOption struct {
 }
 
 func (s *ShadowQuic) selectClient(ctx context.Context) *shadowquic.Client {
-	if !isWindowsTTLContext(ctx) || s.newWinClient == nil {
-		return s.client
-	}
-	s.winMu.Lock()
-	defer s.winMu.Unlock()
-	if s.winClient == nil {
-		s.winClient = s.newWinClient()
-	}
-	return s.winClient
+	return s.ttlPool.getNoErr(ctx, s.client)
 }
 
 func (s *ShadowQuic) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
@@ -92,13 +81,11 @@ func (s *ShadowQuic) Close() error {
 	if s.client != nil {
 		firstErr = s.client.Close()
 	}
-	s.winMu.Lock()
-	winClient := s.winClient
-	s.winClient = nil
-	s.winMu.Unlock()
-	if winClient != nil {
-		if err := winClient.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	for _, c := range s.ttlPool.takeAll() {
+		if c != nil {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
@@ -215,7 +202,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
 			return quicConn, nil
 		},
 	})
-	outbound.newWinClient = func() *shadowquic.Client {
+	outbound.ttlPool.init(func(ttl int) (*shadowquic.Client, error) {
 		return shadowquic.NewClient(&shadowquic.ClientOption{
 			UDPOverStream:        option.UDPOverStream,
 			CongestionController: option.CongestionController,
@@ -224,15 +211,15 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
 			CWND:                 option.CWND,
 			BBRProfile:           option.BBRProfile,
 			Dial: func(ctx context.Context) (*quic.Conn, error) {
-				ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+				ctx = dialer.WithInitialTTL(ctx, ttl)
 				_, quicConn, err := shadowquic.DialQuic(ctx, outbound.addr, outbound.DialOptions(), outbound.dialer, outbound.tlsConfig, outbound.quicConfig, shadowquic.DialQuicOption{Early: option.ZeroRTT})
 				if err != nil {
 					return nil, err
 				}
 				return quicConn, nil
 			},
-		})
-	}
+		}), nil
+	})
 
 	return outbound, nil
 }

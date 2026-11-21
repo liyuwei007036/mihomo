@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"sync"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -34,11 +33,9 @@ const defaultHopInterval = 30
 type Hysteria2 struct {
 	*Base
 
-	option       *Hysteria2Option
-	client       *hysteria2.Client
-	winMu        sync.Mutex
-	winClient    *hysteria2.Client
-	newWinClient func() (*hysteria2.Client, error)
+	option  *Hysteria2Option
+	client  *hysteria2.Client
+	ttlPool ttlClientPool[*hysteria2.Client]
 }
 
 type Hysteria2Option struct {
@@ -95,19 +92,7 @@ type Hysteria2RealmOption struct {
 }
 
 func (h *Hysteria2) selectClient(ctx context.Context) (*hysteria2.Client, error) {
-	if !isWindowsTTLContext(ctx) || h.newWinClient == nil {
-		return h.client, nil
-	}
-	h.winMu.Lock()
-	defer h.winMu.Unlock()
-	if h.winClient == nil {
-		c, err := h.newWinClient()
-		if err != nil {
-			return nil, err
-		}
-		h.winClient = c
-	}
-	return h.winClient, nil
+	return h.ttlPool.get(ctx, h.client)
 }
 
 func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
@@ -148,13 +133,11 @@ func (h *Hysteria2) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winClient = nil
-	h.winMu.Unlock()
-	if winClient != nil {
-		if err := winClient.CloseWithError(errors.New("proxy removed")); err != nil {
-			errs = append(errs, err)
+	for _, c := range h.ttlPool.takeAll() {
+		if c != nil {
+			if err := c.CloseWithError(errors.New("proxy removed")); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -357,20 +340,20 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		return nil, err
 	}
 	outbound.client = client
-	outbound.newWinClient = func() (*hysteria2.Client, error) {
-		winOptions := clientOptions
-		winOptions.TLSConfig = tlsClientConfig.Clone()
-		winDialer := wrapDialerWithTTL(outbound.dialer, dialer.WindowsInitialTTL)
-		winOptions.PacketListener = winDialer
-		winOptions.QuicDialer = qtls.QuicDialerFunc(func(ctx context.Context, addr string, pktDialer qtls.PacketDialer, tlsCfg *tls.Config, cfg *quic.Config, early bool) (net.PacketConn, *quic.Conn, error) {
-			ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+	outbound.ttlPool.init(func(ttl int) (*hysteria2.Client, error) {
+		ttlOptions := clientOptions
+		ttlOptions.TLSConfig = tlsClientConfig.Clone()
+		ttlDialer := wrapDialerWithTTL(outbound.dialer, ttl)
+		ttlOptions.PacketListener = ttlDialer
+		ttlOptions.QuicDialer = qtls.QuicDialerFunc(func(ctx context.Context, addr string, pktDialer qtls.PacketDialer, tlsCfg *tls.Config, cfg *quic.Config, early bool) (net.PacketConn, *quic.Conn, error) {
+			ctx = dialer.WithInitialTTL(ctx, ttl)
 			if err := echConfig.ClientHandle(ctx, tlsCfg); err != nil {
 				return nil, nil, err
 			}
 			return common.DialQuic(ctx, addr, outbound.DialOptions(), pktDialer, tlsCfg, cfg, common.DialQuicOption{Early: early})
 		})
-		return hysteria2.NewClient(winOptions)
-	}
+		return hysteria2.NewClient(ttlOptions)
+	})
 
 	return outbound, nil
 }

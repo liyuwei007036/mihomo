@@ -6,11 +6,9 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/anytls"
@@ -22,11 +20,9 @@ import (
 
 type AnyTLS struct {
 	*Base
-	client       *anytls.Client
-	winMu        sync.Mutex
-	winClient    *anytls.Client
-	newWinClient func() *anytls.Client
-	option       *AnyTLSOption
+	client  *anytls.Client
+	ttlPool ttlClientPool[*anytls.Client]
+	option  *AnyTLSOption
 }
 
 type AnyTLSOption struct {
@@ -56,15 +52,7 @@ type AnyTLSOption struct {
 }
 
 func (t *AnyTLS) selectClient(ctx context.Context) *anytls.Client {
-	if !isWindowsTTLContext(ctx) || t.newWinClient == nil {
-		return t.client
-	}
-	t.winMu.Lock()
-	defer t.winMu.Unlock()
-	if t.winClient == nil {
-		t.winClient = t.newWinClient()
-	}
-	return t.winClient
+	return t.ttlPool.getNoErr(ctx, t.client)
 }
 
 func (t *AnyTLS) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
@@ -109,13 +97,11 @@ func (t *AnyTLS) Close() error {
 	if err := t.client.Close(); err != nil {
 		errs = append(errs, err)
 	}
-	t.winMu.Lock()
-	winClient := t.winClient
-	t.winClient = nil
-	t.winMu.Unlock()
-	if winClient != nil {
-		if err := winClient.Close(); err != nil {
-			errs = append(errs, err)
+	for _, c := range t.ttlPool.takeAll() {
+		if c != nil {
+			if err := c.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -201,11 +187,11 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
 
 	client := anytls.NewClient(context.TODO(), tOption)
 	outbound.client = client
-	outbound.newWinClient = func() *anytls.Client {
-		winOption := tOption
-		winOption.Dialer = wrapSingDialerWithTTL(singDialer, dialer.WindowsInitialTTL)
-		return anytls.NewClient(context.TODO(), winOption)
-	}
+	outbound.ttlPool.init(func(ttl int) (*anytls.Client, error) {
+		ttlOption := tOption
+		ttlOption.Dialer = wrapSingDialerWithTTL(singDialer, ttl)
+		return anytls.NewClient(context.TODO(), ttlOption), nil
+	})
 
 	return outbound, nil
 }

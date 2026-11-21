@@ -22,6 +22,7 @@ type DirectOption struct {
 
 // DialContext implements C.ProxyAdapter
 func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	ctx = dialer.WithoutRelayTTL(ctx)
 	if err := d.loopBack.CheckConn(metadata); err != nil {
 		return nil, err
 	}
@@ -36,6 +37,7 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
 
 // ListenPacketContext implements C.ProxyAdapter
 func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	ctx = dialer.WithoutRelayTTL(ctx)
 	if err := d.loopBack.CheckPacketConn(metadata); err != nil {
 		return nil, err
 	}

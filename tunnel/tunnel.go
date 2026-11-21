@@ -467,8 +467,8 @@ func handleUDPConn(packet C.PacketAdapter) {
 			dialMetadata := metadata.Pure()
 			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
 			defer cancel()
-			if metadata.IsWindows {
-				ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+			if metadata.InitialTTL > 0 {
+				ctx = dialer.WithInitialTTL(ctx, int(metadata.InitialTTL))
 			}
 			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
 				return proxy.ListenPacketContext(ctx, dialMetadata)
@@ -577,8 +577,8 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
 	defer cancel()
-	if metadata.IsWindows {
-		ctx = dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+	if metadata.InitialTTL > 0 {
+		ctx = dialer.WithInitialTTL(ctx, int(metadata.InitialTTL))
 	}
 	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
 		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
